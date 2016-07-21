@@ -647,7 +647,7 @@ public class Sync15CollectionClient<T: CleartextPayloadJSON> {
         return self.encrypter.serializer(record)?.toString(false)
     }
 
-    public func post(lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+    private func post(uri: NSURL, lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
         let deferred = Deferred<Maybe<StorageResponse<POSTResult>>>(defaultQueue: client.resultQueue)
 
         if self.client.checkBackoff(deferred) {
@@ -668,6 +668,10 @@ public class Sync15CollectionClient<T: CleartextPayloadJSON> {
         })
 
         return deferred
+    }
+
+    public func post(lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        return self.post(self.collectionURI, lines: lines, ifUnmodifiedSince: ifUnmodifiedSince)
     }
 
     public func post(records: [Record<T>], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
