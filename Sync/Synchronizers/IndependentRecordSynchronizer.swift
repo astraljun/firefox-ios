@@ -183,21 +183,13 @@ extension TimestampedSingleCollectionSynchronizer {
 
         log.debug("Uploading \(records.count) modified records in \(batches.count) batches.")
 
-        let perChunk: ([String], Timestamp) -> DeferredTimestamp = { (lines, timestamp) in
-            log.debug("Uploading \(lines.count) records.")
-            // TODO: use I-U-S.
+        // TODO: use I-U-S.
 
-            // Each time we do the storage operation, we might receive a backoff notification.
-            // For a success response, this will be on the subsequent request, which means we don't
-            // have to worry about handling successes and failures mixed with backoffs here.
-            return storageClient.post(lines, ifUnmodifiedSince: nil)
-                >>== { onUpload($0.value) }
-        }
-
-        let start = deferMaybe(lastTimestamp)
-        return walk(batches, start: start, f: perChunk)
-            // Chain the last upload timestamp right into our lastFetched timestamp.
-            // This is what Sync clients tend to do, but we can probably do better.
+        // Each time we do the storage operation, we might receive a backoff notification.
+        // For a success response, this will be on the subsequent request, which means we don't
+        // have to worry about handling successes and failures mixed with backoffs here.
+        return storageClient.batchPost(batches, ifUnmodifiedSince: nil)
+            >>== { onUpload($0.value) }
             >>== effect(self.setTimestamp)
     }
 }
