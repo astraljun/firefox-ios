@@ -71,6 +71,12 @@ public class RecordParseError: MaybeErrorType {
     }
 }
 
+public class BatchStartError: MaybeErrorType {
+    public var description: String {
+        return "Failed to parse batch start response."
+    }
+}
+
 public class MalformedMetaGlobalError: MaybeErrorType {
     public var description: String {
         return "Supplied meta/global for upload did not serialize to valid JSON."
@@ -229,6 +235,17 @@ public struct StorageResponse<T> {
     init(value: T, response: NSHTTPURLResponse) {
         self.value = value
         self.metadata = ResponseMetadata(response: response)
+    }
+}
+
+public typealias BatchToken = String
+
+public extension BatchToken {
+    static func fromJSON(json: JSON) -> BatchToken? {
+        if json.isError {
+            return nil
+        }
+        return json["batch"].asString
     }
 }
 
