@@ -642,9 +642,27 @@ public class Sync15CollectionClient<T: CleartextPayloadJSON> {
         return self.collectionURI.URLByAppendingPathComponent(guid)
     }
 
-    // Exposed so we can batch by size.
-    public func serializeRecord(record: Record<T>) -> String? {
-        return self.encrypter.serializer(record)?.toString(false)
+    private func startBatchPost() -> Deferred<Maybe<BatchToken>> {
+        let deferred = Deferred<Maybe<BatchToken>>(defaultQueue: client.resultQueue)
+
+        if self.client.checkBackoff(deferred) {
+            return deferred
+        }
+
+        let startBatchURI = self.collectionURI.URLByAppendingPathComponent("batch=true")
+        let req = client.requestPOST(startBatchURI, body: [String](), ifUnmodifiedSince: nil)
+        req.responsePartialParsedJSON(queue: collectionQueue, completionHandler: self.client.errorWrap(deferred) { (_, response, result) in
+            if let json: JSON = result.value as? JSON,
+                let token = BatchToken.fromJSON(json) {
+                deferred.fill(Maybe(success: token))
+                return
+            } else {
+                log.warning("Couldn't parse JSON response.")
+            }
+            deferred.fill(Maybe(failure: BatchStartError()))
+        })
+
+        return deferred
     }
 
     private func post(uri: NSURL, lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
@@ -668,6 +686,31 @@ public class Sync15CollectionClient<T: CleartextPayloadJSON> {
         })
 
         return deferred
+    }
+
+    public func batchPost(batches: [[String]], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        return startBatchPost() >>== { batchToken in
+            // To send records in the batch, we include the batchToken in the path.
+            let batchedURI = self.collectionURI.URLByAppendingPathComponent("batch=\(batchToken)")
+
+            // To finalize the batch, we append commit=true after the batch path.
+            let endBatchURI = batchedURI.URLByAppendingPathComponent("commit=true")
+
+            let perBatch: (lines: [String]) -> Success = { lines in
+                return self.post(batchedURI, lines: lines, ifUnmodifiedSince: ifUnmodifiedSince)
+                    >>> effect({ log.debug("Uploading \(lines.count) records for batch \(batchToken)") })
+                    >>> succeed
+            }
+
+            return walk(batches, f: perBatch) >>> {
+                return self.post(endBatchURI, lines: [], ifUnmodifiedSince: ifUnmodifiedSince)
+            }
+        }
+    }
+
+    // Exposed so we can batch by size.
+    public func serializeRecord(record: Record<T>) -> String? {
+        return self.encrypter.serializer(record)?.toString(false)
     }
 
     public func post(lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
