@@ -110,6 +110,31 @@ extension TimestampedSingleCollectionSynchronizer {
             >>== effect(self.setTimestamp)
     }
 
+    func uploadRecords<T>(records: [Record<T>], inBatch batch: Sync15BatchClient<T>, by: Int, lastTimestamp: Timestamp, onUpload: POSTResult -> DeferredTimestamp) -> DeferredTimestamp {
+
+        if records.isEmpty {
+            log.debug("No modified records to upload.")
+            return deferMaybe(lastTimestamp)
+        }
+
+        let storageOp: ([Record<T>], Timestamp) -> DeferredTimestamp = { records, timestamp in
+            // TODO: use I-U-S.
+
+            // Each time we do the storage operation, we might receive a backoff notification.
+            // For a success response, this will be on the subsequent request, which means we don't
+            // have to worry about handling successes and failures mixed with backoffs here.
+            return batch.uploadRecords(records, ifUnmodifiedSince: nil) >>> { deferMaybe(timestamp) }
+        }
+
+        log.debug("Uploading \(records.count) modified records for batch \(batch.batchToken).")
+
+        // Chain the last upload timestamp right into our lastFetched timestamp.
+        // This is what Sync clients tend to do, but we can probably do better.
+        // Upload 50 records at a time.
+        return Uploader().sequentialPosts(records, by: by, lastTimestamp: lastTimestamp, storageOp: storageOp)
+            >>== effect(self.setTimestamp)
+    }
+
     func uploadRecordsInChunks<T>(records: [Record<T>], lastTimestamp: Timestamp, storageClient: Sync15CollectionClient<T>, onUpload: POSTResult -> DeferredTimestamp) -> DeferredTimestamp {
 
         // Obvious sanity.
@@ -182,14 +207,22 @@ extension TimestampedSingleCollectionSynchronizer {
         }
 
         log.debug("Uploading \(records.count) modified records in \(batches.count) batches.")
+        return storageClient.beginBatch() >>== { batch in
 
-        // TODO: use I-U-S.
+            let perChunk: ([String]) -> Success = { lines in
+                log.debug("Uploading \(lines.count) records.")
+                // TODO: use I-U-S.
+                // Each time we do the storage operation, we might receive a backoff notification.
+                // For a success response, this will be on the subsequent request, which means we don't
+                // have to worry about handling successes and failures mixed with backoffs here.
+                return batch.uploadRecords(lines, ifUnmodifiedSince: nil) >>> succeed
+            }
 
-        // Each time we do the storage operation, we might receive a backoff notification.
-        // For a success response, this will be on the subsequent request, which means we don't
-        // have to worry about handling successes and failures mixed with backoffs here.
-        return storageClient.batchPost(batches, ifUnmodifiedSince: nil)
-            >>== { onUpload($0.value) }
-            >>== effect(self.setTimestamp)
+            return walk(batches, f: perChunk) >>> {
+                return batch.commit()
+                    >>== { onUpload($0.value) }
+                    >>== effect(self.setTimestamp)
+            }
+        }
     }
 }

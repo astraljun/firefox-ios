@@ -107,18 +107,17 @@ public class LoginsSynchronizer: IndependentRecordSynchronizer, Synchronizer {
         }
     }
 
-    private func uploadModifiedLogins(logins: [Login], lastTimestamp: Timestamp, fromStorage storage: SyncableLogins, withServer storageClient: Sync15CollectionClient<LoginPayload>) -> DeferredTimestamp {
-        return self.uploadRecords(logins.map(makeLoginRecord), by: 50, lastTimestamp: lastTimestamp, storageClient: storageClient) {
+    private func uploadModifiedLogins(logins: [Login], lastTimestamp: Timestamp, fromStorage storage: SyncableLogins, inBatch batch: Sync15BatchClient<LoginPayload>) -> DeferredTimestamp {
+        return self.uploadRecords(logins.map(makeLoginRecord), inBatch: batch, by: 50, lastTimestamp: lastTimestamp) {
             storage.markAsSynchronized($0.success, modified: $0.modified)
         }
     }
 
-    private func uploadDeletedLogins(guids: [GUID], lastTimestamp: Timestamp, fromStorage storage: SyncableLogins, withServer storageClient: Sync15CollectionClient<LoginPayload>) -> DeferredTimestamp {
-
+    private func uploadDeletedLogins(guids: [GUID], lastTimestamp: Timestamp, fromStorage storage: SyncableLogins, inBatch batch: Sync15BatchClient<LoginPayload>) -> DeferredTimestamp {
         let records = guids.map(makeDeletedLoginRecord)
 
         // Deletions are smaller, so upload 100 at a time.
-        return self.uploadRecords(records, by: 100, lastTimestamp: lastTimestamp, storageClient: storageClient) {
+        return self.uploadRecords(records, inBatch: batch, by: 100, lastTimestamp: lastTimestamp) {
             storage.markAsDeleted($0.success) >>> always($0.modified)
         }
     }
@@ -130,26 +129,26 @@ public class LoginsSynchronizer: IndependentRecordSynchronizer, Synchronizer {
     // We will already have reconciled any conflicts on download, so this upload phase should
     // be as simple as uploading any changed or deleted items.
     private func uploadOutgoingFromStorage(storage: SyncableLogins, lastTimestamp: Timestamp, withServer storageClient: Sync15CollectionClient<LoginPayload>) -> Success {
-
-        let uploadDeleted: Timestamp -> DeferredTimestamp = { timestamp in
-            storage.getDeletedLoginsToUpload()
-                >>== { guids in
-                    return self.uploadDeletedLogins(guids, lastTimestamp: timestamp, fromStorage: storage, withServer: storageClient)
+        return storageClient.beginBatch() >>== { batch in
+            let uploadDeleted: Timestamp -> DeferredTimestamp = { timestamp in
+                storage.getDeletedLoginsToUpload() >>== { guids in
+                    return self.uploadDeletedLogins(guids, lastTimestamp: timestamp, fromStorage: storage, inBatch: batch)
+                }
             }
-        }
 
-        let uploadModified: Timestamp -> DeferredTimestamp = { timestamp in
-            storage.getModifiedLoginsToUpload()
-                >>== { logins in
-                    return self.uploadModifiedLogins(logins, lastTimestamp: timestamp, fromStorage: storage, withServer: storageClient)
+            let uploadModified: Timestamp -> DeferredTimestamp = { timestamp in
+                storage.getModifiedLoginsToUpload() >>== { logins in
+                    return self.uploadModifiedLogins(logins, lastTimestamp: timestamp, fromStorage: storage, inBatch: batch)
+                }
             }
-        }
 
-        return deferMaybe(lastTimestamp)
-            >>== uploadDeleted
-            >>== uploadModified
-            >>> effect({ log.debug("Done syncing.") })
-            >>> succeed
+            return deferMaybe(lastTimestamp)
+                >>== uploadDeleted
+                >>== uploadModified
+                >>> batch.commit
+                >>> effect({ log.debug("Done syncing.") })
+                >>> succeed
+        }
     }
 
     public func synchronizeLocalLogins(logins: SyncableLogins, withServer storageClient: Sync15StorageClient, info: InfoCollections) -> SyncResult {

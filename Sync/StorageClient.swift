@@ -622,6 +622,80 @@ public class Sync15StorageClient {
     }
 }
 
+public class Sync15BatchClient<T: CleartextPayloadJSON> {
+    let batchToken: BatchToken
+    private let collectionURI: NSURL
+    private let postClient: POSTClient15<T>
+
+    init(batchToken: BatchToken, collectionURI: NSURL, postClient: POSTClient15<T>) {
+        self.batchToken = batchToken
+        self.collectionURI = collectionURI
+        self.postClient = postClient
+    }
+
+    func uploadRecords(lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        let batchURI = collectionURI.URLByAppendingPathComponent("batch=\(batchToken)")
+        return postClient.post(batchURI, lines: lines, ifUnmodifiedSince: ifUnmodifiedSince)
+    }
+
+    func uploadRecords(records: [Record<T>], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        let lines = optFilter(records.map(postClient.serializeRecord))
+        return uploadRecords(lines, ifUnmodifiedSince: ifUnmodifiedSince)
+    }
+
+    func commit() -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        let commitURI = collectionURI.URLByAppendingPathComponent("batch=\(batchToken)").URLByAppendingPathComponent("commit=true")
+        return postClient.post(commitURI, records: [], ifUnmodifiedSince: nil)
+    }
+}
+
+public class POSTClient15<T: CleartextPayloadJSON> {
+    private let queue: dispatch_queue_t
+    private let client: Sync15StorageClient
+    private let encrypter: RecordEncrypter<T>
+
+    public init(queue: dispatch_queue_t, storageClient: Sync15StorageClient, encrypter: RecordEncrypter<T>) {
+        self.queue = queue
+        self.client = storageClient
+        self.encrypter = encrypter
+    }
+
+    public func post(uri: NSURL, records: [Record<T>], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        // TODO: charset
+        // TODO: if any of these fail, we should do _something_. Right now we just ignore them.
+        let lines = optFilter(records.map(self.serializeRecord))
+        return self.post(uri, lines: lines, ifUnmodifiedSince: ifUnmodifiedSince)
+    }
+
+    // Exposed so we can batch by size.
+    public func serializeRecord(record: Record<T>) -> String? {
+        return self.encrypter.serializer(record)?.toString(false)
+    }
+
+    public func post(uri: NSURL, lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        let deferred = Deferred<Maybe<StorageResponse<POSTResult>>>(defaultQueue: client.resultQueue)
+
+        if self.client.checkBackoff(deferred) {
+            return deferred
+        }
+
+        let req = client.requestPOST(uri, body: lines, ifUnmodifiedSince: nil)
+        req.responsePartialParsedJSON(queue: queue, completionHandler: self.client.errorWrap(deferred) { (_, response, result) in
+            if let json: JSON = result.value as? JSON,
+               let result = POSTResult.fromJSON(json) {
+                let storageResponse = StorageResponse(value: result, response: response!)
+                deferred.fill(Maybe(success: storageResponse))
+                return
+            } else {
+                log.warning("Couldn't parse JSON response.")
+            }
+            deferred.fill(Maybe(failure: RecordParseError()))
+        })
+
+        return deferred
+    }
+}
+
 /**
  * We'd love to nest this in the overall storage client, but Swift
  * forbids the nesting of a generic class inside another class.
@@ -631,18 +705,20 @@ public class Sync15CollectionClient<T: CleartextPayloadJSON> {
     private let encrypter: RecordEncrypter<T>
     private let collectionURI: NSURL
     private let collectionQueue = dispatch_queue_create("com.mozilla.sync.collectionclient", DISPATCH_QUEUE_SERIAL)
+    private let postClient: POSTClient15<T>
 
     init(client: Sync15StorageClient, serverURI: NSURL, collection: String, encrypter: RecordEncrypter<T>) {
         self.client = client
         self.encrypter = encrypter
         self.collectionURI = serverURI.URLByAppendingPathComponent(collection, isDirectory: false)
+        self.postClient = POSTClient15(queue: collectionQueue, storageClient: client, encrypter: encrypter)
     }
 
     private func uriForRecord(guid: String) -> NSURL {
         return self.collectionURI.URLByAppendingPathComponent(guid)
     }
 
-    private func startBatchPost() -> Deferred<Maybe<BatchToken>> {
+    private func newBatchToken() -> Deferred<Maybe<BatchToken>> {
         let deferred = Deferred<Maybe<BatchToken>>(defaultQueue: client.resultQueue)
 
         if self.client.checkBackoff(deferred) {
@@ -661,68 +737,27 @@ public class Sync15CollectionClient<T: CleartextPayloadJSON> {
             }
             deferred.fill(Maybe(failure: BatchStartError()))
         })
-
         return deferred
     }
 
-    private func post(uri: NSURL, lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
-        let deferred = Deferred<Maybe<StorageResponse<POSTResult>>>(defaultQueue: client.resultQueue)
-
-        if self.client.checkBackoff(deferred) {
-            return deferred
-        }
-
-        let req = client.requestPOST(self.collectionURI, body: lines, ifUnmodifiedSince: nil)
-        req.responsePartialParsedJSON(queue: collectionQueue, completionHandler: self.client.errorWrap(deferred) { (_, response, result) in
-            if let json: JSON = result.value as? JSON,
-               let result = POSTResult.fromJSON(json) {
-                let storageResponse = StorageResponse(value: result, response: response!)
-                deferred.fill(Maybe(success: storageResponse))
-                return
-            } else {
-                log.warning("Couldn't parse JSON response.")
-            }
-            deferred.fill(Maybe(failure: RecordParseError()))
-        })
-
-        return deferred
-    }
-
-    public func batchPost(batches: [[String]], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
-        return startBatchPost() >>== { batchToken in
-            // To send records in the batch, we include the batchToken in the path.
-            let batchedURI = self.collectionURI.URLByAppendingPathComponent("batch=\(batchToken)")
-
-            // To finalize the batch, we append commit=true after the batch path.
-            let endBatchURI = batchedURI.URLByAppendingPathComponent("commit=true")
-
-            let perBatch: (lines: [String]) -> Success = { lines in
-                return self.post(batchedURI, lines: lines, ifUnmodifiedSince: ifUnmodifiedSince)
-                    >>> effect({ log.debug("Uploading \(lines.count) records for batch \(batchToken)") })
-                    >>> succeed
-            }
-
-            return walk(batches, f: perBatch) >>> {
-                return self.post(endBatchURI, lines: [], ifUnmodifiedSince: ifUnmodifiedSince)
-            }
+    public func beginBatch() -> Deferred<Maybe<Sync15BatchClient<T>>> {
+        return newBatchToken() >>== { token in
+            log.debug("Begin batch upload for batch \(token).")
+            return deferMaybe(Sync15BatchClient(batchToken: token, collectionURI: self.collectionURI, postClient: self.postClient))
         }
     }
 
     // Exposed so we can batch by size.
     public func serializeRecord(record: Record<T>) -> String? {
-        return self.encrypter.serializer(record)?.toString(false)
+        return postClient.serializeRecord(record)
     }
 
     public func post(lines: [String], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
-        return self.post(self.collectionURI, lines: lines, ifUnmodifiedSince: ifUnmodifiedSince)
+        return postClient.post(self.collectionURI, lines: lines, ifUnmodifiedSince: ifUnmodifiedSince)
     }
 
     public func post(records: [Record<T>], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
-
-        // TODO: charset
-        // TODO: if any of these fail, we should do _something_. Right now we just ignore them.
-        let lines = optFilter(records.map(self.serializeRecord))
-        return self.post(lines, ifUnmodifiedSince: ifUnmodifiedSince)
+        return postClient.post(self.collectionURI, records: records, ifUnmodifiedSince: ifUnmodifiedSince)
     }
 
     public func put(record: Record<T>, ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<Timestamp>>> {
